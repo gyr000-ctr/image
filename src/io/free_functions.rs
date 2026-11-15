@@ -91,6 +91,13 @@ pub(crate) fn encoder_for_format<'a, W: Write + Seek>(
         ImageFormat::WebP => Box::new(webp::WebPEncoder::new_lossless(buffered_write)),
         #[cfg(feature = "hdr")]
         ImageFormat::Hdr => Box::new(hdr::HdrEncoder::new(buffered_write)),
+        #[cfg(all(feature = "jxl", jxl_available))]
+        ImageFormat::Jxl => Box::new(jxl::JxlEncoder::new(buffered_write)),
+        // Feature on but no libjxl: expose the placeholder so the failure is
+        // an explicit `Unsupported` error rather than the generic
+        // "unknown format" fallback below.
+        #[cfg(all(feature = "jxl", not(jxl_available)))]
+        ImageFormat::Jxl => Box::new(jxl::JxlEncoderUnsupported::new(buffered_write)),
         #[allow(unreachable_patterns)] // unreachable if all formats are enabled
         _ => {
             return Err(ImageError::Unsupported(
@@ -103,9 +110,13 @@ pub(crate) fn encoder_for_format<'a, W: Write + Seek>(
     })
 }
 
-static MAGIC_BYTES: [(&[u8], &[u8], ImageFormat); 21] = [
+static MAGIC_BYTES: [(&[u8], &[u8], ImageFormat); 23] = [
     (b"\x89PNG\r\n\x1a\n", b"", ImageFormat::Png),
     (&[0xff, 0xd8, 0xff], b"", ImageFormat::Jpeg),
+    // JPEG XL bare codestream signature.
+    (&[0xff, 0x0a], b"", ImageFormat::Jxl),
+    // JPEG XL BMFF container signature ("JXL ").
+    (b"\x00\x00\x00\x0cJXL \r\n\x87\n", b"", ImageFormat::Jxl),
     (b"GIF89a", b"", ImageFormat::Gif),
     (b"GIF87a", b"", ImageFormat::Gif),
     (

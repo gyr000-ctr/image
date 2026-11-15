@@ -50,6 +50,9 @@ pub enum ImageFormat {
 
     /// An Image in QOI Format
     Qoi,
+
+    /// An Image in JPEG XL Format
+    Jxl,
 }
 
 impl ImageFormat {
@@ -87,6 +90,7 @@ impl ImageFormat {
                 "pbm" | "pam" | "ppm" | "pgm" | "pnm" => ImageFormat::Pnm,
                 "ff" => ImageFormat::Farbfeld,
                 "qoi" => ImageFormat::Qoi,
+                "jxl" => ImageFormat::Jxl,
                 _ => return None,
             })
         }
@@ -167,6 +171,7 @@ impl ImageFormat {
             // Qoi's MIME type is being worked on.
             // See: https://github.com/phoboslab/qoi/issues/167
             "image/x-qoi" => Some(ImageFormat::Qoi),
+            "image/jxl" => Some(ImageFormat::Jxl),
             _ => None,
         }
     }
@@ -211,6 +216,7 @@ impl ImageFormat {
             // Qoi's MIME type is being worked on.
             // See: https://github.com/phoboslab/qoi/issues/167
             ImageFormat::Qoi => "image/x-qoi",
+            ImageFormat::Jxl => "image/jxl",
             // farbfeld's MIME type taken from https://www.wikidata.org/wiki/Q28206109
             ImageFormat::Farbfeld => "application/octet-stream",
         }
@@ -244,6 +250,7 @@ impl ImageFormat {
             // According to: https://aomediacodec.github.io/av1-avif/#mime-registration
             ImageFormat::Avif => &["avif"],
             ImageFormat::Qoi => &["qoi"],
+            ImageFormat::Jxl => &["jxl"],
         }
     }
 
@@ -269,6 +276,8 @@ impl ImageFormat {
             ImageFormat::Farbfeld => cfg!(feature = "ff"),
             ImageFormat::Avif => cfg!(feature = "avif-native"),
             ImageFormat::Qoi => cfg!(feature = "qoi"),
+            // No decoder is provided in this crate.
+            ImageFormat::Jxl => false,
         }
     }
 
@@ -294,6 +303,9 @@ impl ImageFormat {
             ImageFormat::OpenExr => cfg!(feature = "exr"),
             ImageFormat::Qoi => cfg!(feature = "qoi"),
             ImageFormat::Hdr => cfg!(feature = "hdr"),
+            // Writing JXL requires both the feature and a usable system
+            // libjxl found by the build script.
+            ImageFormat::Jxl => cfg!(all(feature = "jxl", jxl_available)),
         }
     }
 
@@ -314,6 +326,7 @@ impl ImageFormat {
             ImageFormat::OpenExr,
             ImageFormat::Qoi,
             ImageFormat::Hdr,
+            ImageFormat::Jxl,
         ]
         .iter()
         .copied()
@@ -350,6 +363,7 @@ mod tests {
         assert_eq!(from_path("./a.Ppm").unwrap(), ImageFormat::Pnm);
         assert_eq!(from_path("./a.pgm").unwrap(), ImageFormat::Pnm);
         assert_eq!(from_path("./a.AViF").unwrap(), ImageFormat::Avif);
+        assert_eq!(from_path("./a.jxl").unwrap(), ImageFormat::Jxl);
         assert!(from_path("./a.txt").is_err());
         assert!(from_path("./a").is_err());
     }
@@ -358,7 +372,7 @@ mod tests {
     fn image_formats_are_recognized() {
         use ImageFormat::*;
         const ALL_FORMATS: &[ImageFormat] = &[
-            Avif, Png, Jpeg, Gif, WebP, Pnm, Tiff, Tga, Bmp, Ico, Hdr, Farbfeld, OpenExr,
+            Avif, Png, Jpeg, Gif, WebP, Pnm, Tiff, Tga, Bmp, Ico, Hdr, Farbfeld, OpenExr, Jxl,
         ];
         for &format in ALL_FORMATS {
             let mut file = Path::new("file.nothing").to_owned();
@@ -409,6 +423,7 @@ mod tests {
         assert!(all_formats.contains(&ImageFormat::Bmp));
         assert!(all_formats.contains(&ImageFormat::Farbfeld));
         assert!(all_formats.contains(&ImageFormat::Jpeg));
+        assert!(all_formats.contains(&ImageFormat::Jxl));
     }
 
     #[test]

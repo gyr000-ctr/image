@@ -17,6 +17,13 @@ Breaking Changes:
 Features:
  - Added `RbgImage::from_raw_bgr` and `RbgaImage::from_raw_bgra` constructors, which convert
    from `BGR(A)` with an optimized specialization for bytes of `BGRA`
+ - Added JPEG XL encoding behind the optional `jxl` feature, backed by a system
+   libjxl: `JxlEncoder` exposes quality/lossless/effort/thread controls, RGB/RGBA in
+   8- and 16-bit samples and ICC embedding, with streaming output and distinguishable
+   errors for bad dimensions, oversized images, invalid ICC profiles and unsupported
+   color types. If libjxl is unavailable at build time the build still succeeds (with
+   a warning) and JXL encoding is explicitly rejected via `JxlEncoderUnsupported`
+   rather than silently degrading to another format.
 
 Structural changes:
   - Increased MSRV to 1.88.0 (from 1.85.0)

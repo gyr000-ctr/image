@@ -202,6 +202,7 @@ pub use crate::images::flat;
 /// | `hdr`   | HDR      |
 /// | `ico`   | ICO      |
 /// | `jpeg`  | JPEG     |
+/// | `jxl`   | JPEG XL  | Encoding only; links against a system libjxl.
 /// | `png`   | PNG      |
 /// | `pnm`   | PNM      |
 /// | `qoi`   | QOI      |
@@ -245,6 +246,10 @@ pub mod codecs {
     pub mod ico;
     #[cfg(feature = "jpeg")]
     pub mod jpeg;
+    /// JPEG XL encoding. Always present so that builds without the `jxl`
+    /// feature still expose the `JxlEncoderUnsupported` placeholder, which
+    /// fails explicitly instead of silently degrading to another format.
+    pub mod jxl;
     #[cfg(feature = "exr")]
     pub mod openexr;
     #[cfg(feature = "png")]

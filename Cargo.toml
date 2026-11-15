@@ -98,6 +98,12 @@ qoi = ["dep:qoi"]
 tga = []
 tiff = ["dep:tiff"]
 webp = ["dep:image-webp"]
+# JPEG XL encoding. Links against the system libjxl (and libjxl_threads).
+# This feature never breaks the build: if no usable libjxl is found, a Cargo
+# warning is emitted and the crate compiles with an explicit
+# `JxlEncoderUnsupported` placeholder, so `--all-features` builds do not need
+# the native dependency. Encoders never fall back to another format.
+jxl = []
 
 # Other features
 # TODO: add pic-scale-safe rayon in the next breaking release,
