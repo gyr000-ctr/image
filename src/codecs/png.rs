@@ -8,9 +8,11 @@ use core::num::NonZeroU32;
 use std::borrow::Cow;
 use std::io::{BufRead, Seek, Write};
 
-use png::{BlendOp, DeflateCompression, DisposeOp};
+use png::DeflateCompression;
 
-use crate::animation::Delay;
+pub use png::{BlendOp, DisposeOp};
+
+use crate::animation::{Delay, Frame};
 use crate::color::{ColorType, ExtendedColorType};
 use crate::error::{
     DecodingError, EncodingError, ImageError, ImageResult, LimitError, LimitErrorKind,
@@ -779,6 +781,79 @@ impl<W: Write> PngEncoder<W> {
         height: u32,
         color: ExtendedColorType,
     ) -> ImageResult<()> {
+        let encoder = Self::create_encoder(
+            self.w,
+            width,
+            height,
+            color,
+            self.compression,
+            self.filter,
+            &self.icc_profile,
+            &self.exif_metadata,
+            self.xmp_metadata,
+        )?;
+
+        let mut writer = encoder.write_header().map_err(ImageError::from_png_enc)?;
+        writer
+            .write_image_data(data)
+            .map_err(ImageError::from_png_enc)?;
+        writer.finish().map_err(ImageError::from_png_enc)
+    }
+
+    /// Convert this encoder into an [`ApngEncoder`] writing an animation of `num_frames` frames.
+    ///
+    /// The compression, filter and metadata settings of this encoder are carried over. The
+    /// `loop_count` determines how often the animation is played, see [`LoopCount`].
+    ///
+    /// Returns an error if `num_frames` is `0`, an APNG animation must contain at least one
+    /// frame.
+    pub fn into_apng_encoder(
+        self,
+        num_frames: u32,
+        loop_count: LoopCount,
+    ) -> ImageResult<ApngEncoder<W>> {
+        if num_frames == 0 {
+            return Err(ImageError::Encoding(EncodingError::new(
+                ImageFormat::Png.into(),
+                "APNG animations must contain at least one frame",
+            )));
+        }
+
+        let num_plays = match loop_count {
+            LoopCount::Infinite => 0,
+            LoopCount::Finite(n) => n.get(),
+        };
+
+        Ok(ApngEncoder {
+            w: Some(self.w),
+            compression: self.compression,
+            filter: self.filter,
+            icc_profile: self.icc_profile,
+            exif_metadata: self.exif_metadata,
+            xmp_metadata: self.xmp_metadata,
+            num_frames,
+            num_plays,
+            writer: None,
+            width: 0,
+            height: 0,
+            frames_written: 0,
+        })
+    }
+
+    /// Build the underlying `png` encoder with the configuration shared by the static and the
+    /// animated (APNG) encoding paths.
+    #[allow(clippy::too_many_arguments)]
+    fn create_encoder<'a>(
+        w: W,
+        width: u32,
+        height: u32,
+        color: ExtendedColorType,
+        compression: CompressionType,
+        filter: FilterType,
+        icc_profile: &'a [u8],
+        exif_metadata: &'a [u8],
+        xmp_metadata: Option<String>,
+    ) -> ImageResult<png::Encoder<'a, W>> {
         let (ct, bits) = match color {
             ExtendedColorType::L8 => (png::ColorType::Grayscale, png::BitDepth::Eight),
             ExtendedColorType::L16 => (png::ColorType::Grayscale, png::BitDepth::Sixteen),
@@ -798,7 +873,7 @@ impl<W: Write> PngEncoder<W> {
             }
         };
 
-        let comp = match self.compression {
+        let comp = match compression {
             CompressionType::Balanced => png::Compression::Balanced,
             CompressionType::Best => png::Compression::High,
             CompressionType::Fast => png::Compression::Fast,
@@ -807,14 +882,14 @@ impl<W: Write> PngEncoder<W> {
             CompressionType::Level(_) => png::Compression::Fast, // whatever, will be overridden
         };
 
-        let advanced_comp = match self.compression {
+        let advanced_comp = match compression {
             // Do not set level 0 as a Zlib level to avoid Zlib backend variance.
             // For example, in miniz_oxide level 0 is very slow.
             CompressionType::Level(n @ 1..) => Some(DeflateCompression::Level(n)),
             _ => None,
         };
 
-        let filter = match self.filter {
+        let filter = match filter {
             FilterType::NoFilter => png::Filter::NoFilter,
             FilterType::Sub => png::Filter::Sub,
             FilterType::Up => png::Filter::Up,
@@ -825,17 +900,16 @@ impl<W: Write> PngEncoder<W> {
 
         let mut info = png::Info::with_size(width, height);
 
-        if !self.icc_profile.is_empty() {
-            info.icc_profile = Some(Cow::Borrowed(&self.icc_profile));
+        if !icc_profile.is_empty() {
+            info.icc_profile = Some(Cow::Borrowed(icc_profile));
         }
-        if !self.exif_metadata.is_empty() {
-            info.exif_metadata = Some(Cow::Borrowed(&self.exif_metadata));
+        if !exif_metadata.is_empty() {
+            info.exif_metadata = Some(Cow::Borrowed(exif_metadata));
         }
 
-        let mut encoder =
-            png::Encoder::with_info(self.w, info).map_err(ImageError::from_png_enc)?;
+        let mut encoder = png::Encoder::with_info(w, info).map_err(ImageError::from_png_enc)?;
 
-        if let Some(xmp_text) = self.xmp_metadata {
+        if let Some(xmp_text) = xmp_metadata {
             encoder
                 .add_itxt_chunk(XMP_KEY.to_string(), xmp_text)
                 .map_err(ImageError::from_png_enc)?;
@@ -848,12 +922,263 @@ impl<W: Write> PngEncoder<W> {
             encoder.set_deflate_compression(compression);
         }
         encoder.set_filter(filter);
-        let mut writer = encoder.write_header().map_err(ImageError::from_png_enc)?;
+
+        Ok(encoder)
+    }
+}
+
+/// A single frame of an APNG animation.
+///
+/// This wraps an [`animation::Frame`](Frame) with the blend and dispose operations that APNG
+/// supports in addition to the frame delay. See [`ApngEncoder`].
+///
+/// All frames of one animation must have the same dimensions, the dimensions of the first frame
+/// determine the size of the animation canvas.
+#[derive(Clone)]
+pub struct ApngFrame {
+    frame: Frame,
+    blend_op: BlendOp,
+    dispose_op: DisposeOp,
+}
+
+impl ApngFrame {
+    /// Create a frame with the default operations, [`BlendOp::Source`] and [`DisposeOp::None`].
+    #[must_use]
+    pub fn new(frame: Frame) -> Self {
+        ApngFrame {
+            frame,
+            blend_op: BlendOp::Source,
+            dispose_op: DisposeOp::None,
+        }
+    }
+
+    /// Create a frame with explicit blend and dispose operations.
+    #[must_use]
+    pub fn from_parts(frame: Frame, blend_op: BlendOp, dispose_op: DisposeOp) -> Self {
+        ApngFrame {
+            frame,
+            blend_op,
+            dispose_op,
+        }
+    }
+
+    /// The underlying frame, containing the pixel data, delay and offsets.
+    #[must_use]
+    pub fn frame(&self) -> &Frame {
+        &self.frame
+    }
+
+    /// Convert back into the underlying [`Frame`], discarding the blend and dispose operations.
+    #[must_use]
+    pub fn into_frame(self) -> Frame {
+        self.frame
+    }
+
+    /// The blend operation of this frame.
+    #[must_use]
+    pub fn blend_op(&self) -> BlendOp {
+        self.blend_op
+    }
+
+    /// Set the blend operation of this frame.
+    pub fn set_blend_op(&mut self, blend_op: BlendOp) {
+        self.blend_op = blend_op;
+    }
+
+    /// The dispose operation of this frame.
+    #[must_use]
+    pub fn dispose_op(&self) -> DisposeOp {
+        self.dispose_op
+    }
+
+    /// Set the dispose operation of this frame.
+    pub fn set_dispose_op(&mut self, dispose_op: DisposeOp) {
+        self.dispose_op = dispose_op;
+    }
+}
+
+impl From<Frame> for ApngFrame {
+    fn from(frame: Frame) -> Self {
+        ApngFrame::new(frame)
+    }
+}
+
+/// Encoder for animated PNG (APNG) images.
+///
+/// Created through [`PngEncoder::into_apng_encoder`]. Frames are written one at a time with
+/// [`ApngEncoder::encode_frame`], the animation is finalized with [`ApngEncoder::finish`].
+///
+/// The first frame is encoded as the default image (`IDAT`) so that decoders without APNG
+/// support display it as a static image, all further frames are encoded as `fdAT` chunks. All
+/// frames must have the same dimensions.
+///
+/// Dropping the encoder without calling [`ApngEncoder::finish`] still writes a valid file
+/// trailer but does not report errors and does not verify that all announced frames were
+/// written.
+pub struct ApngEncoder<W: Write> {
+    /// The writer, taken once the first frame is written and the header is emitted.
+    w: Option<W>,
+    compression: CompressionType,
+    filter: FilterType,
+    icc_profile: Vec<u8>,
+    exif_metadata: Vec<u8>,
+    xmp_metadata: Option<String>,
+    num_frames: u32,
+    num_plays: u32,
+    /// The underlying writer, created when the first frame determines the canvas dimensions.
+    writer: Option<png::Writer<W>>,
+    width: u32,
+    height: u32,
+    frames_written: u32,
+}
+
+impl<W: Write> ApngEncoder<W> {
+    /// Encode one frame of the animation.
+    ///
+    /// The first frame determines the dimensions of the animation canvas. Returns an error if
+    /// the dimensions of a later frame differ from it, or if more frames are written than the
+    /// `num_frames` announced in [`PngEncoder::into_apng_encoder`].
+    pub fn encode_frame(&mut self, frame: ApngFrame) -> ImageResult<()> {
+        if self.frames_written >= self.num_frames {
+            return Err(ImageError::Parameter(ParameterError::from_kind(
+                ParameterErrorKind::NoMoreData,
+            )));
+        }
+
+        let ApngFrame {
+            frame,
+            blend_op,
+            dispose_op,
+        } = frame;
+        let buffer = frame.buffer();
+
+        if self.writer.is_none() {
+            let mut encoder = PngEncoder::create_encoder(
+                self.w.take().ok_or_else(|| {
+                    ImageError::Parameter(ParameterError::from_kind(
+                        ParameterErrorKind::FailedAlready,
+                    ))
+                })?,
+                buffer.width(),
+                buffer.height(),
+                ExtendedColorType::Rgba8,
+                self.compression,
+                self.filter,
+                &self.icc_profile,
+                &self.exif_metadata,
+                self.xmp_metadata.take(),
+            )?;
+
+            encoder
+                .set_animated(self.num_frames, self.num_plays)
+                .map_err(ImageError::from_png_enc)?;
+            encoder.validate_sequence(true);
+
+            self.width = buffer.width();
+            self.height = buffer.height();
+            self.writer = Some(encoder.write_header().map_err(ImageError::from_png_enc)?);
+        }
+
+        if buffer.width() != self.width || buffer.height() != self.height {
+            return Err(ImageError::Parameter(ParameterError::from_kind(
+                ParameterErrorKind::DimensionMismatch,
+            )));
+        }
+
+        let (delay_num, delay_den) = delay_to_fraction(frame.delay());
+
+        // Unwrap: the writer was initialized above if it did not exist yet.
+        let writer = self.writer.as_mut().unwrap();
         writer
-            .write_image_data(data)
+            .set_frame_delay(delay_num, delay_den)
             .map_err(ImageError::from_png_enc)?;
+        writer
+            .set_blend_op(blend_op)
+            .map_err(ImageError::from_png_enc)?;
+        writer
+            .set_dispose_op(dispose_op)
+            .map_err(ImageError::from_png_enc)?;
+        writer
+            .write_image_data(buffer.as_raw())
+            .map_err(ImageError::from_png_enc)?;
+
+        self.frames_written += 1;
+        Ok(())
+    }
+
+    /// Encode all frames of the animation.
+    ///
+    /// Consider using [`ApngEncoder::try_encode_frames`] to encode an iterator of fallible
+    /// frames instead.
+    pub fn encode_frames<F>(&mut self, frames: F) -> ImageResult<()>
+    where
+        F: IntoIterator<Item = ApngFrame>,
+    {
+        for frame in frames {
+            self.encode_frame(frame)?;
+        }
+        Ok(())
+    }
+
+    /// Try to encode a collection of `ImageResult<ApngFrame>` objects.
+    ///
+    /// Whenever an `Err` item is encountered, that value is returned without further actions.
+    pub fn try_encode_frames<F>(&mut self, frames: F) -> ImageResult<()>
+    where
+        F: IntoIterator<Item = ImageResult<ApngFrame>>,
+    {
+        for frame in frames {
+            self.encode_frame(frame?)?;
+        }
+        Ok(())
+    }
+
+    /// Finalize the animation, writing the image trailer.
+    ///
+    /// Returns an error if no frame was written at all, or if fewer frames were written than
+    /// the `num_frames` announced in [`PngEncoder::into_apng_encoder`].
+    pub fn finish(mut self) -> ImageResult<()> {
+        let Some(writer) = self.writer.take() else {
+            return Err(ImageError::Encoding(EncodingError::new(
+                ImageFormat::Png.into(),
+                "APNG animation contains no frames",
+            )));
+        };
+
+        // With sequence validation enabled this also verifies that exactly the announced number
+        // of frames was written.
         writer.finish().map_err(ImageError::from_png_enc)
     }
+}
+
+/// Convert a delay into the `delay_num`/`delay_den` fraction of seconds stored in an `fcTL`
+/// chunk. Both numerator and denominator are clamped to the `u16` range of the chunk, very
+/// large or very precise delays are approximated.
+fn delay_to_fraction(delay: Delay) -> (u16, u16) {
+    fn gcd(mut a: u64, mut b: u64) -> u64 {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    }
+
+    let (numer, denom) = delay.numer_denom_ms();
+    // The delay is numer/denom milliseconds, that is numer/(denom*1000) seconds.
+    let mut num = u64::from(numer);
+    let mut den = u64::from(denom) * 1000;
+
+    let divisor = gcd(num, den);
+    num /= divisor;
+    den /= divisor;
+
+    // Reduce the fraction until both parts fit into a u16. Each step at least halves the larger
+    // part so this terminates quickly.
+    while num > u64::from(u16::MAX) || den > u64::from(u16::MAX) {
+        num = (num + 1) / 2;
+        den = (den + 1) / 2;
+    }
+
+    (num as u16, den as u16)
 }
 
 impl<W: Write> ImageEncoder for PngEncoder<W> {
@@ -1179,5 +1504,273 @@ mod tests {
                 Rgba([0, 0, 255, 255]),
             ]
         );
+    }
+
+    fn apng_test_frame(pixel: [u8; 4], width: u32, height: u32, delay_ms: u32) -> ApngFrame {
+        let buffer = crate::RgbaImage::from_pixel(width, height, Rgba(pixel));
+        ApngFrame::new(Frame::from_parts(
+            buffer,
+            0,
+            0,
+            Delay::from_millis(delay_ms),
+        ))
+    }
+
+    fn collect_apng_frames(encoded: &[u8]) -> Vec<Frame> {
+        let decoder = PngDecoder::new(Cursor::new(encoded)).apng().unwrap();
+        let reader = crate::ImageReader::from_decoder(Box::new(decoder));
+        reader.into_frames().collect_frames().unwrap()
+    }
+
+    #[test]
+    fn apng_encoder_roundtrip() {
+        let frames = vec![
+            apng_test_frame([255, 0, 0, 255], 4, 4, 100),
+            apng_test_frame([0, 255, 0, 255], 4, 4, 200),
+            apng_test_frame([0, 0, 255, 255], 4, 4, 300),
+        ];
+
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = PngEncoder::new(&mut encoded)
+                .into_apng_encoder(3, LoopCount::Infinite)
+                .unwrap();
+            encoder.encode_frames(frames).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        // The animation chunks must be present: acTL, one fcTL per frame and fdAT for all
+        // frames after the first (which is stored as IDAT).
+        let has_chunk = |name: &[u8; 4]| encoded.windows(4).any(|w| w == name);
+        assert!(has_chunk(b"acTL"));
+        assert!(has_chunk(b"fcTL"));
+        assert!(has_chunk(b"fdAT"));
+
+        let mut decoder = PngDecoder::new(Cursor::new(&encoded));
+        assert!(decoder.is_apng().unwrap());
+
+        let mut decoder = PngDecoder::new(Cursor::new(&encoded)).apng().unwrap();
+        match decoder.animation_attributes() {
+            Some(DecodedAnimationAttributes {
+                loop_count: LoopCount::Infinite,
+            }) => {}
+            other => panic!("unexpected animation attributes: {other:?}"),
+        }
+
+        let frames = collect_apng_frames(&encoded);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].delay(), Delay::from_millis(100));
+        assert_eq!(frames[1].delay(), Delay::from_millis(200));
+        assert_eq!(frames[2].delay(), Delay::from_millis(300));
+
+        let colors = [
+            *frames[0].buffer().get_pixel(0, 0),
+            *frames[1].buffer().get_pixel(0, 0),
+            *frames[2].buffer().get_pixel(0, 0),
+        ];
+        assert_eq!(
+            colors,
+            [
+                Rgba([255, 0, 0, 255]),
+                Rgba([0, 255, 0, 255]),
+                Rgba([0, 0, 255, 255]),
+            ]
+        );
+    }
+
+    #[test]
+    fn apng_encoder_finite_loop_count() {
+        let mut encoded = Vec::new();
+        let mut encoder = PngEncoder::new(&mut encoded)
+            .into_apng_encoder(2, LoopCount::Finite(NonZeroU32::new(7).unwrap()))
+            .unwrap();
+        encoder
+            .encode_frame(apng_test_frame([0, 0, 0, 255], 2, 2, 10))
+            .unwrap();
+        encoder
+            .encode_frame(apng_test_frame([255, 255, 255, 255], 2, 2, 10))
+            .unwrap();
+        encoder.finish().unwrap();
+
+        let mut decoder = PngDecoder::new(Cursor::new(&encoded)).apng().unwrap();
+        match decoder.animation_attributes() {
+            Some(DecodedAnimationAttributes {
+                loop_count: LoopCount::Finite(n),
+            }) => assert_eq!(n.get(), 7),
+            other => panic!("unexpected animation attributes: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apng_encoder_blend_and_dispose() {
+        // Frame 0: opaque red, disposed to the background before the next frame.
+        // Frame 1: fully transparent, blended over the (cleared) canvas.
+        let frame0 = ApngFrame::from_parts(
+            apng_test_frame([255, 0, 0, 255], 2, 2, 50).into_frame(),
+            BlendOp::Source,
+            DisposeOp::Background,
+        );
+        let frame1 = ApngFrame::from_parts(
+            apng_test_frame([0, 0, 0, 0], 2, 2, 50).into_frame(),
+            BlendOp::Over,
+            DisposeOp::None,
+        );
+
+        let mut encoded = Vec::new();
+        let mut encoder = PngEncoder::new(&mut encoded)
+            .into_apng_encoder(2, LoopCount::Infinite)
+            .unwrap();
+        encoder.encode_frames(vec![frame0, frame1]).unwrap();
+        encoder.finish().unwrap();
+
+        let frames = collect_apng_frames(&encoded);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(*frames[0].buffer().get_pixel(0, 0), Rgba([255, 0, 0, 255]));
+        // The red frame was disposed to the background, blending a transparent frame over it
+        // leaves a transparent pixel. With DisposeOp::None it would stay red.
+        assert_eq!(*frames[1].buffer().get_pixel(0, 0), Rgba([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn apng_encoder_blend_over_alpha() {
+        // Frame 0: opaque red, kept on the canvas.
+        // Frame 1: half transparent blue, blended over it.
+        let frame0 = ApngFrame::from_parts(
+            apng_test_frame([255, 0, 0, 255], 2, 2, 50).into_frame(),
+            BlendOp::Source,
+            DisposeOp::None,
+        );
+        let frame1 = ApngFrame::from_parts(
+            apng_test_frame([0, 0, 255, 128], 2, 2, 50).into_frame(),
+            BlendOp::Over,
+            DisposeOp::None,
+        );
+
+        let mut encoded = Vec::new();
+        let mut encoder = PngEncoder::new(&mut encoded)
+            .into_apng_encoder(2, LoopCount::Infinite)
+            .unwrap();
+        encoder.encode_frames(vec![frame0, frame1]).unwrap();
+        encoder.finish().unwrap();
+
+        let frames = collect_apng_frames(&encoded);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            *frames[1].buffer().get_pixel(0, 0),
+            Rgba([127, 0, 128, 255])
+        );
+    }
+
+    #[test]
+    fn apng_encoder_rejects_zero_frames() {
+        let mut encoded = Vec::new();
+        let err = PngEncoder::new(&mut encoded)
+            .into_apng_encoder(0, LoopCount::Infinite)
+            .err()
+            .unwrap();
+        assert!(matches!(err, ImageError::Encoding(_)));
+    }
+
+    #[test]
+    fn apng_encoder_frame_dimension_mismatch() {
+        let mut encoded = Vec::new();
+        let mut encoder = PngEncoder::new(&mut encoded)
+            .into_apng_encoder(2, LoopCount::Infinite)
+            .unwrap();
+        encoder
+            .encode_frame(apng_test_frame([255, 0, 0, 255], 4, 4, 100))
+            .unwrap();
+
+        let err = encoder
+            .encode_frame(apng_test_frame([0, 0, 0, 255], 2, 4, 100))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                err,
+                ImageError::Parameter(ref p) if p.kind() == ParameterErrorKind::DimensionMismatch
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn apng_encoder_too_many_frames() {
+        let mut encoded = Vec::new();
+        let mut encoder = PngEncoder::new(&mut encoded)
+            .into_apng_encoder(1, LoopCount::Infinite)
+            .unwrap();
+        encoder
+            .encode_frame(apng_test_frame([255, 0, 0, 255], 4, 4, 100))
+            .unwrap();
+
+        let err = encoder
+            .encode_frame(apng_test_frame([0, 0, 0, 255], 4, 4, 100))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                err,
+                ImageError::Parameter(ref p) if p.kind() == ParameterErrorKind::NoMoreData
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn apng_encoder_finish_without_frames() {
+        let mut encoded = Vec::new();
+        let encoder = PngEncoder::new(&mut encoded)
+            .into_apng_encoder(1, LoopCount::Infinite)
+            .unwrap();
+        let err = encoder.finish().err().unwrap();
+        assert!(matches!(err, ImageError::Encoding(_)));
+    }
+
+    #[test]
+    fn apng_encoder_finish_with_missing_frames() {
+        let mut encoded = Vec::new();
+        let mut encoder = PngEncoder::new(&mut encoded)
+            .into_apng_encoder(2, LoopCount::Infinite)
+            .unwrap();
+        encoder
+            .encode_frame(apng_test_frame([255, 0, 0, 255], 4, 4, 100))
+            .unwrap();
+        // Only one of the two announced frames was written.
+        assert!(encoder.finish().is_err());
+    }
+
+    #[test]
+    fn apng_encoder_static_png_output_unchanged() {
+        // A gradient so that filtering and compression actually have something to do.
+        let mut img = Vec::new();
+        for y in 0..16u8 {
+            for x in 0..16u8 {
+                img.extend_from_slice(&[x * 16, y * 16, x ^ y, 255]);
+            }
+        }
+
+        let encode = || {
+            let mut out = Vec::new();
+            PngEncoder::new(&mut out)
+                .write_image(&img, 16, 16, ExtendedColorType::Rgba8)
+                .unwrap();
+            out
+        };
+
+        let a = encode();
+        let b = encode();
+
+        // Encoding is deterministic and contains no animation chunks.
+        assert_eq!(a, b);
+        assert!(!a.windows(4).any(|w| w == b"acTL"));
+        assert!(!a.windows(4).any(|w| w == b"fcTL"));
+        assert!(!a.windows(4).any(|w| w == b"fdAT"));
+
+        // The static image still decodes to the original pixels.
+        let mut decoder = PngDecoder::new(Cursor::new(&a));
+        assert!(!decoder.is_apng().unwrap());
+        let (decoded, _) = decoder_to_vec::<u8>(&mut decoder).unwrap();
+        assert_eq!(decoded, img);
     }
 }
